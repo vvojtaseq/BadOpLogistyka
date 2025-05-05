@@ -74,7 +74,6 @@ class CPMApp:
                     for pred in preds:
                         graph.add_edge(pred, name)
 
-                # CPM classic
                 es, ef = {}, {}
                 for node in nx.topological_sort(graph):
                     es[node] = max([ef.get(pred, 0) for pred in graph.predecessors(node)], default=0)
@@ -98,46 +97,65 @@ class CPMApp:
                     start, end = [x.strip() for x in rel.split("-")]
                     graph.add_edge(start, end, weight=duration)
 
-                durations = {node: 0 for node in graph.nodes}
+                tasks = [(u, v, d['weight']) for u, v, d in graph.edges(data=True)]
+
                 es, ef = {}, {}
-                for node in nx.topological_sort(graph):
-                    max_ef = 0
-                    for pred in graph.predecessors(node):
-                        edge_duration = graph[pred][node]['weight']
-                        pred_ef = ef[pred]
-                        max_ef = max(max_ef, pred_ef + edge_duration)
-                    es[node] = max_ef
-                    ef[node] = es[node]
+                for u, v, d in tasks:
+                    es[(u, v)] = max([ef.get((pred, u), 0) for pred in graph.predecessors(u)], default=0)
+                    ef[(u, v)] = es[(u, v)] + d
 
                 max_time = max(ef.values())
+
                 lf, ls = {}, {}
-                for node in reversed(list(nx.topological_sort(graph))):
-                    min_ls = max_time
-                    for succ in graph.successors(node):
-                        edge_duration = graph[node][succ]['weight']
-                        succ_ls = ls[succ] - edge_duration
-                        min_ls = min(min_ls, succ_ls)
-                    lf[node] = min_ls if list(graph.successors(node)) else max_time
-                    ls[node] = lf[node]
+                for u, v, d in reversed(tasks):
+                    lf[(u, v)] = min([ls.get((v, succ), max_time) for succ in graph.successors(v)], default=max_time)
+                    ls[(u, v)] = lf[(u, v)] - d
 
-                slack = {node: ls[node] - es[node] for node in graph.nodes}
-                critical_path = [node for node in graph.nodes if slack[node] == 0]
+                slack = {e: ls[e] - es[e] for e in es}
+                critical_path = [e for e in es if slack[e] == 0]
 
-            # Create DataFrame
-            table_data = []
-            for node in graph.nodes:
-                table_data.append({
-                    "Zadanie": node,
-                    "ES": es[node],
-                    "EF": ef[node],
-                    "LS": ls[node],
-                    "LF": lf[node],
-                    "Rezerwa": slack[node],
-                    "Krytyczna": "TAK" if node in critical_path else ""
-                })
+                durations = {f"{u}->{v}": d for u, v, d in tasks}
+                es_nodes = {f"{u}->{v}": es[(u, v)] for u, v, d in tasks}
+                ef_nodes = {f"{u}->{v}": ef[(u, v)] for u, v, d in tasks}
+                ls_nodes = {f"{u}->{v}": ls[(u, v)] for u, v, d in tasks}
+                lf_nodes = {f"{u}->{v}": lf[(u, v)] for u, v, d in tasks}
+                slack_nodes = {f"{u}->{v}": slack[(u, v)] for u, v, d in tasks}
+                critical_node_ids = [f"{u}->{v}" for u, v in critical_path]
 
-            df = pd.DataFrame(table_data)
-            self.show_results(df, graph, critical_path, es, ef, ls, lf, slack, durations)
+            if mode == "classic":
+                table_data = []
+                for node in graph.nodes:
+                    table_data.append({
+                        "Zadanie": node,
+                        "ES": es[node],
+                        "EF": ef[node],
+                        "LS": ls[node],
+                        "LF": lf[node],
+                        "Rezerwa": slack[node],
+                        "Krytyczna": "TAK" if node in critical_path else ""
+                    })
+                df = pd.DataFrame(table_data)
+                self.show_results(df, graph, critical_path, es, ef, ls, lf, slack, durations)
+            else:
+                table_data = []
+                for u, v, d in tasks:
+                    task_id = f"{u}->{v}"
+                    graph[u][v]['ES'] = es[(u, v)]
+                    graph[u][v]['EF'] = ef[(u, v)]
+                    graph[u][v]['LS'] = ls[(u, v)]
+                    graph[u][v]['LF'] = lf[(u, v)]
+                    graph[u][v]['Slack'] = slack[(u, v)]
+                    table_data.append({
+                        "Zadanie": task_id,
+                        "ES": es_nodes[task_id],
+                        "EF": ef_nodes[task_id],
+                        "LS": ls_nodes[task_id],
+                        "LF": lf_nodes[task_id],
+                        "Rezerwa": slack_nodes[task_id],
+                        "Krytyczna": "TAK" if task_id in critical_node_ids else ""
+                    })
+                df = pd.DataFrame(table_data)
+                self.show_results(df, graph, critical_node_ids, es_nodes, ef_nodes, ls_nodes, lf_nodes, slack_nodes, durations)
 
         except Exception as e:
             messagebox.showerror("Błąd", str(e))
@@ -167,10 +185,28 @@ class CPMApp:
         nx.draw_networkx_nodes(graph, pos, node_color=node_colors, node_size=4000, edgecolors='black', linewidths=1.5)
         nx.draw_networkx_edges(graph, pos, edge_color=edge_colors, width=2, arrows=True)
 
-        custom_labels = {
-            node: f"{node}\nES:{es[node]} EF:{ef[node]}\nLS:{ls[node]} LF:{lf[node]}\nSlack: {slack[node]}"
-            for node in graph.nodes
-        }
+        if self.mode.get() == "classic":
+            custom_labels = {
+                node: f"{node}\nES:{es[node]} EF:{ef[node]}\nLS:{ls[node]} LF:{lf[node]}\nSlack: {slack[node]}"
+                for node in graph.nodes
+            }
+            edge_labels = {(u, v): "" for u, v in graph.edges}
+        else:
+            custom_labels = {node: node for node in graph.nodes}
+            edge_labels = {}
+            for u, v in graph.edges:
+                try:
+                    edge_labels[(u, v)] = (
+                        f"{graph[u][v]['weight']}d\n"
+                        f"ES:{es[(u,v)]} EF:{ef[(u,v)]}\n"
+                        f"LS:{ls[(u,v)]} LF:{lf[(u,v)]}\n"
+                        f"Slack:{slack[(u,v)]}"
+                    )
+                except KeyError:
+                    edge_labels[(u, v)] = f"{graph[u][v]['weight']}d"
+
+
+
         nx.draw_networkx_labels(graph, pos, labels=custom_labels, font_size=10)
 
         if self.mode.get() == "edge":
